@@ -1,0 +1,11 @@
+# Dependencies for MuJoCo UR5e pick-and-place simulation environment with ACT and SmolVLA policies.
+# Install these before running mujoco_env_act.py or mujoco_env_smolvla.py:
+#   pip install -r mujoco-requirements.txt
+
+robosuite>=1.4.0
+mujoco>=3.1.0
+gymnasium>=0.29.0
+numpy>=1.24.0
+transformers>=4.40.0
+num2words>=0.5.14
+imageio[ffmpeg]>=2.30.0
