@@ -115,10 +115,12 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
                 act_np = np.expand_dims(act_np, axis=0)
 
             if act_np.shape[-1] == 4:
-                xyz = act_np[:, :3]
+                curr_eef_pos = obs["agent_pos"][0, :3]
+                target_eef_pos = act_np[0, :3]
+                delta_pos = (target_eef_pos - curr_eef_pos) * 5.0
                 gripper = act_np[:, 3:]
                 rpy_zero = np.zeros((act_np.shape[0], 3), dtype=np.float32)
-                env_action = np.concatenate([xyz, rpy_zero, gripper], axis=-1)
+                env_action = np.concatenate([np.expand_dims(delta_pos, axis=0), rpy_zero, gripper], axis=-1)
             else:
                 env_action = act_np
         else:
