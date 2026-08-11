@@ -51,9 +51,9 @@ def evaluate_policy_on_dataset(
     start_time = time.time()
 
     for ep_idx in trange(num_eval_episodes, desc="Evaluating Episodes"):
-        ep_meta = dataset.episode_data_index
-        from_idx = ep_meta["from"][ep_idx].item()
-        to_idx = ep_meta["to"][ep_idx].item()
+        ep = dataset.meta.episodes[ep_idx]
+        from_idx = ep["dataset_from_index"]
+        to_idx = ep["dataset_to_index"]
 
         policy.reset()
 
