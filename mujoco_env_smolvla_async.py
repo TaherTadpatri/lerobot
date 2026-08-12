@@ -1,7 +1,7 @@
 """Asynchronous non-blocking MuJoCo simulation script for SmolVLA policy on UR5e robot.
 
 Offloads SmolVLA neural network inference to a background worker thread to eliminate FPS drop/damping,
-while the main thread steps MuJoCo physics smoothly at 30+ FPS.
+while the main thread steps MuJoCo physics smoothly at 20 FPS matching dataset capture rate.
 """
 
 import contextlib
@@ -19,7 +19,12 @@ from lerobot.envs.configs import HubEnvConfig
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla import SmolVLAPolicy
 
-# 1. Select device
+# 1. FPS and Task Configuration
+FPS = 20
+CONTROL_DT = 1.0 / FPS  # 0.05s per control frame (20 FPS)
+TASK_DESCRIPTION = "Pick up the can and place it in the correct bin."
+
+# Device selection (GPU / CPU)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 2. Configure environment
@@ -28,7 +33,7 @@ cfg = HubEnvConfig(
     task="pick_place_can",
 )
 
-print("Loading UR5e Pick & Place simulation environment...")
+print(f"Loading UR5e Pick & Place simulation environment ({FPS} FPS)...")
 envs = make_env(cfg, trust_remote_code=True)
 vec_env = envs[next(iter(envs))][0]
 obs, info = vec_env.reset()
@@ -82,7 +87,7 @@ def policy_async_worker():
         with obs_lock:
             current_obs = latest_obs
 
-        raw_policy_obs = format_obs_for_policy(current_obs, env_wrapper.task_description)
+        raw_policy_obs = format_obs_for_policy(current_obs, TASK_DESCRIPTION)
         policy_obs = preprocessor(raw_policy_obs)
 
         with torch.no_grad():
@@ -101,9 +106,9 @@ def policy_async_worker():
 worker_thread = threading.Thread(target=policy_async_worker, daemon=True)
 worker_thread.start()
 
-print("\nStarting Async SmolVLA MuJoCo Viewer (Physics running smoothly at full FPS)...")
+print(f"\nStarting Async SmolVLA MuJoCo Viewer ({FPS} FPS loop)...")
 
-last_gripper_state = 1.0  # Start open (+1.0 in Robosuite)
+last_gripper_state = -1.0  # Start open (-1.0 in Robosuite)
 
 # 4. Launch MuJoCo viewer with non-blocking async action consumer loop
 with mujoco.viewer.launch_passive(m, d) as viewer:
@@ -111,6 +116,7 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
     viewer._opt.geomgroup[1] = 1
 
     for step in range(10000):
+        frame_start = time.time()
         if not action_queue.empty():
             act_np = action_queue.get()
             if act_np.ndim == 1:
@@ -119,16 +125,11 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
             if act_np.shape[-1] == 4:
                 curr_eef_pos = obs["agent_pos"][0, :3]
                 target_eef_pos = act_np[0, :3]
-                delta_pos = np.clip((target_eef_pos - curr_eef_pos) * 10.0, -1.0, 1.0)
+                delta_pos = (target_eef_pos - curr_eef_pos) * 3.5
 
-                # Binarize and latch gripper action to prevent random open/close flickering
+                # Gripper mapping (+1.0 close, -1.0 open in Robosuite)
                 model_grip = act_np[0, 3]
-                if model_grip > 0.1:
-                    env_grip = -1.0  # Close gripper in Robosuite
-                elif model_grip < -0.1:
-                    env_grip = 1.0  # Open gripper in Robosuite
-                else:
-                    env_grip = last_gripper_state
+                env_grip = 1.0 if model_grip > 0.0 else -1.0
                 last_gripper_state = env_grip
 
                 rpy_zero = np.zeros((1, 3), dtype=np.float32)
@@ -147,7 +148,11 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
             latest_obs = obs
 
         viewer.sync()
-        time.sleep(0.01)
+
+        elapsed = time.time() - frame_start
+        sleep_time = CONTROL_DT - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
 
         if not viewer.is_running():
             print(f"MuJoCo viewer window closed at step {step}.")
@@ -158,7 +163,7 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
             print(f"Episode finished at step {step}, resetting environment...")
             obs, info = vec_env.reset()
             policy.reset()
-            last_gripper_state = 1.0
+            last_gripper_state = -1.0
             with obs_lock:
                 latest_obs = obs
 

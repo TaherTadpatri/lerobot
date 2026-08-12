@@ -1,4 +1,7 @@
-"""MuJoCo simulation script running SmolVLA policy on UR5e pick & place environment."""
+"""Synchronous MuJoCo simulation script for SmolVLA policy on UR5e Pick & Place task.
+
+Configured at exact 20 FPS dataset collection rate and task description: "Pick up the can and place it in the correct bin."
+"""
 
 import time
 
@@ -12,45 +15,44 @@ from lerobot.envs.configs import HubEnvConfig
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla import SmolVLAPolicy
 
-# 1. Device selection (GPU / CPU)
+# 1. FPS and Task Configuration
+FPS = 20
+CONTROL_DT = 1.0 / FPS  # 0.05s per control frame (20 FPS)
+TASK_DESCRIPTION = "Pick up the can and place it in the correct bin."
+
+# Device selection (GPU / CPU)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 2. Configure Hugging Face Hub environment with Pick & Place Can task
+# 2. Configure environment
 cfg = HubEnvConfig(
     hub_path="castanetnicolas/UR5e_robosuite_pick_place",
     task="pick_place_can",
 )
 
-print("Loading UR5e Pick & Place simulation environment...")
+print(f"Loading UR5e Pick & Place simulation environment ({FPS} FPS)...")
 envs = make_env(cfg, trust_remote_code=True)
 vec_env = envs[next(iter(envs))][0]
 obs, info = vec_env.reset()
 
-# Access environment wrapper and raw robosuite simulation instance
 env_wrapper = vec_env.envs[0]
 robosuite_env = env_wrapper._env
 sim = robosuite_env.sim
 m = sim.model._model
 d = sim.data._data
 
-# 3. Load pretrained SmolVLA Policy from Hugging Face Hub
+# 3. Load Policy
 model_id = "castanetnicolas/smolvla_ur5e_pick_place"
-print(f"Loading pretrained SmolVLA policy '{model_id}'...")
+print(f"Loading SmolVLA policy '{model_id}'...")
 policy = SmolVLAPolicy.from_pretrained(model_id)
 policy.to(device)
 policy.eval()
 policy.reset()
 
-# Create policy pre- and post-processors
 preprocessor, postprocessor = make_pre_post_processors(
     policy.config,
     pretrained_path=model_id,
     preprocessor_overrides={"device_processor": {"device": str(device)}},
 )
-
-print(f"\nLoaded Task: '{env_wrapper.task}' ({env_wrapper.task_description})")
-print(f"Policy Device: {device}")
-print("Native MuJoCo GUI viewer started. Running SmolVLA policy inference...\n")
 
 
 def format_obs_for_policy(obs_dict, task_description):
@@ -67,16 +69,17 @@ def format_obs_for_policy(obs_dict, task_description):
     }
 
 
-# Track gripper state to prevent flickering (latching)
-last_gripper_state = 1.0  # Start open (+1.0 in Robosuite)
+print(f"\nStarting SmolVLA MuJoCo Viewer ({FPS} FPS loop)...")
 
-# 4. Launch native MuJoCo passive viewer GUI window and run policy loop
+# 4. Launch MuJoCo viewer with synchronous inference loop
 with mujoco.viewer.launch_passive(m, d) as viewer:
     viewer._opt.geomgroup[0] = 0
     viewer._opt.geomgroup[1] = 1
 
     for step in range(10000):
-        raw_policy_obs = format_obs_for_policy(obs, env_wrapper.task_description)
+        frame_start = time.time()
+
+        raw_policy_obs = format_obs_for_policy(obs, TASK_DESCRIPTION)
         policy_obs = preprocessor(raw_policy_obs)
 
         with torch.no_grad():
@@ -88,25 +91,18 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
         if act_np.ndim == 1:
             act_np = np.expand_dims(act_np, axis=0)
 
-        # Convert predicted absolute EEF position [x, y, z] to relative delta control commands [dx, dy, dz]
         if act_np.shape[-1] == 4:
             curr_eef_pos = obs["agent_pos"][0, :3]
             target_eef_pos = act_np[0, :3]
-            delta_pos = np.clip((target_eef_pos - curr_eef_pos) * 10.0, -1.0, 1.0)
+            delta_pos = (target_eef_pos - curr_eef_pos) * 3.5
 
-            # Binarize and latch gripper action to prevent random open/close flickering
+            # Gripper mapping (+1.0 close, -1.0 open in Robosuite)
             model_grip = act_np[0, 3]
-            if model_grip > 0.1:
-                env_grip = -1.0  # Close gripper in Robosuite
-            elif model_grip < -0.1:
-                env_grip = 1.0  # Open gripper in Robosuite
-            else:
-                env_grip = last_gripper_state
-            last_gripper_state = env_grip
+            gripper_val = 1.0 if model_grip > 0.0 else -1.0
 
             rpy_zero = np.zeros((1, 3), dtype=np.float32)
             env_action = np.concatenate(
-                [np.expand_dims(delta_pos, axis=0), rpy_zero, np.array([[env_grip]])], axis=-1
+                [np.expand_dims(delta_pos, axis=0), rpy_zero, np.array([[gripper_val]])], axis=-1
             )
         else:
             env_action = act_np
@@ -114,7 +110,11 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
         obs, reward, terminated, truncated, info = vec_env.step(env_action)
 
         viewer.sync()
-        time.sleep(0.01)
+
+        elapsed = time.time() - frame_start
+        sleep_time = CONTROL_DT - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
 
         if not viewer.is_running():
             print(f"MuJoCo viewer window closed at step {step}.")
@@ -124,7 +124,6 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
             print(f"Episode finished at step {step}, resetting environment...")
             obs, info = vec_env.reset()
             policy.reset()
-            last_gripper_state = 1.0
 
 vec_env.close()
-print("Environment closed successfully.")
+print("Simulation closed.")

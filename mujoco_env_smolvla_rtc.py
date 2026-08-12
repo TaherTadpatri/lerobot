@@ -1,7 +1,6 @@
 """MuJoCo simulation script executing SmolVLA policy with Real-Time Control (RTC) & Temporal Action Chunking.
 
-Instead of querying the VLM single-frame-by-single-frame (which causes open/close flickering and drift),
-this script predicts 50-step action chunks and executes smooth multi-step action queues.
+Configured at exact 20 FPS dataset collection rate and task description: "Pick up the can and place it in the correct bin."
 """
 
 import time
@@ -16,7 +15,12 @@ from lerobot.envs.configs import HubEnvConfig
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla import SmolVLAPolicy
 
-# 1. Device selection (GPU / CPU)
+# 1. FPS and Task Configuration
+FPS = 20
+CONTROL_DT = 1.0 / FPS  # 0.05 seconds per step (20 FPS)
+TASK_DESCRIPTION = "Pick up the can and place it in the correct bin."
+
+# Device selection (GPU / CPU)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 2. Configure Hugging Face Hub environment with Pick & Place Can task
@@ -25,7 +29,7 @@ cfg = HubEnvConfig(
     task="pick_place_can",
 )
 
-print("Loading UR5e Pick & Place simulation environment...")
+print(f"Loading UR5e Pick & Place simulation environment (Control Rate: {FPS} FPS)...")
 envs = make_env(cfg, trust_remote_code=True)
 vec_env = envs[next(iter(envs))][0]
 obs, info = vec_env.reset()
@@ -52,9 +56,10 @@ preprocessor, postprocessor = make_pre_post_processors(
     preprocessor_overrides={"device_processor": {"device": str(device)}},
 )
 
-print(f"\nLoaded Task: '{env_wrapper.task}' ({env_wrapper.task_description})")
-print(f"Policy Device: {device}")
-print("Native MuJoCo GUI viewer started. Running SmolVLA Temporal Action Chunking (RTC) rollout...\n")
+print(f"\nLoaded Task Prompt: '{TASK_DESCRIPTION}'")
+print(f"Control Frequency : {FPS} FPS ({CONTROL_DT:.3f}s per step)")
+print(f"Policy Device     : {device}")
+print("Native MuJoCo GUI viewer started. Running SmolVLA RTC rollout...\n")
 
 
 def format_obs_for_policy(obs_dict, task_description):
@@ -81,8 +86,10 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
 
     step = 0
     while viewer.is_running() and step < 10000:
+        step_start_time = time.time()
+
         # Step A: Query VLM for a 50-step action chunk
-        raw_policy_obs = format_obs_for_policy(obs, env_wrapper.task_description)
+        raw_policy_obs = format_obs_for_policy(obs, TASK_DESCRIPTION)
         policy_obs = preprocessor(raw_policy_obs)
 
         with torch.no_grad():
@@ -91,9 +98,10 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
         chunk_tensor = postprocessor(action_chunk)
         chunk_np = chunk_tensor.cpu().numpy().squeeze(0)  # Shape: (50, 4)
 
-        # Step B: Execute execution_horizon steps open-loop from predicted chunk
+        # Step B: Execute execution_horizon steps open-loop from predicted chunk at 20 FPS
         steps_to_exec = min(execution_horizon, len(chunk_np))
         for i in range(steps_to_exec):
+            frame_start_time = time.time()
             pred_act = chunk_np[i]
             curr_eef_pos = obs["agent_pos"][0, :3]
             target_eef_pos = pred_act[:3]
@@ -114,7 +122,12 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
             step += 1
 
             viewer.sync()
-            time.sleep(0.01)
+
+            # Maintain exact 20 FPS loop pacing (0.05s per control frame)
+            elapsed = time.time() - frame_start_time
+            sleep_time = CONTROL_DT - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
             if not viewer.is_running():
                 print(f"MuJoCo viewer window closed at step {step}.")
