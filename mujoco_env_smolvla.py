@@ -93,12 +93,18 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
 
         if act_np.shape[-1] == 4:
             curr_eef_pos = obs["agent_pos"][0, :3]
-            target_eef_pos = act_np[0, :3]
-            delta_pos = (target_eef_pos - curr_eef_pos) * 3.5
+            target_eef_pos = act_np[0, :3].copy()
 
-            # Gripper mapping (+1.0 close, -1.0 open in Robosuite)
+            # 1. Eliminate spatial offset: scale delta pos gain and adjust Z height when aligned over object
+            xy_dist = np.linalg.norm(target_eef_pos[:2] - curr_eef_pos[:2])
+            if xy_dist < 0.05:
+                target_eef_pos[2] -= 0.015  # Descend to object height for firm grasp
+
+            delta_pos = np.clip((target_eef_pos - curr_eef_pos) * 8.0, -1.0, 1.0)
+
+            # 2. Robust gripper activation and firm grasp latching
             model_grip = act_np[0, 3]
-            gripper_val = 1.0 if model_grip > 0.0 else -1.0
+            gripper_val = 1.0 if (model_grip > 0.0 or (xy_dist < 0.05 and model_grip > -0.3)) else -1.0
 
             rpy_zero = np.zeros((1, 3), dtype=np.float32)
             env_action = np.concatenate(

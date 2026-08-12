@@ -1,8 +1,20 @@
-"""MuJoCo simulation script executing SmolVLA policy with Real-Time Control (RTC) & Temporal Action Chunking.
+"""MuJoCo simulation script executing SmolVLA policy with Real-Time Control (RTC).
 
-Configured at exact 20 FPS dataset collection rate and task description: "Pick up the can and place it in the correct bin."
+Multithreading & Temporal Action Chunking (Pure End-to-End VLA Evaluation).
+
+Features:
+1. Pure End-to-End VLA Evaluation: No privileged simulation ground-truth position reads
+   or hardcoded gripper rules are used during control. The SmolVLA neural network
+   operates strictly from camera observations (camera1, camera2) and robot proprioception (agent_pos).
+2. Multithreaded RTC Architecture: Asynchronous VLA neural network chunk prediction
+   runs in a background worker thread (vla_inference_worker), while the main thread
+   steps MuJoCo physics and renders the GUI viewer smoothly at 20 FPS (CONTROL_DT = 0.05s).
+3. Calibrated Proportional OSC Control: Converts SmolVLA predicted absolute EEF position
+   targets into normalized [-1.0, 1.0] delta actions scaled against Robosuite's OSC_POSE
+   controller limit (POS_OUTPUT_MAX = 0.05m/step).
 """
 
+import threading
 import time
 
 import mujoco
@@ -58,8 +70,7 @@ preprocessor, postprocessor = make_pre_post_processors(
 
 print(f"\nLoaded Task Prompt: '{TASK_DESCRIPTION}'")
 print(f"Control Frequency : {FPS} FPS ({CONTROL_DT:.3f}s per step)")
-print(f"Policy Device     : {device}")
-print("Native MuJoCo GUI viewer started. Running SmolVLA RTC rollout...\n")
+print(f"Policy Device     : {device}\n")
 
 
 def format_obs_for_policy(obs_dict, task_description):
@@ -76,20 +87,25 @@ def format_obs_for_policy(obs_dict, task_description):
     }
 
 
-# Temporal Action Chunking settings
-execution_horizon = 8  # Execute 8 steps per VLM chunk prediction
+# Global thread synchronization variables
+obs_lock = threading.Lock()
+chunk_lock = threading.Lock()
 
-# 4. Launch native MuJoCo passive viewer GUI window and run RTC chunked policy loop
-with mujoco.viewer.launch_passive(m, d) as viewer:
-    viewer._opt.geomgroup[0] = 0
-    viewer._opt.geomgroup[1] = 1
+latest_obs_raw = obs
+latest_action_chunk = None
+stop_event = threading.Event()
 
-    step = 0
-    while viewer.is_running() and step < 10000:
-        step_start_time = time.time()
 
-        # Step A: Query VLM for a 50-step action chunk
-        raw_policy_obs = format_obs_for_policy(obs, TASK_DESCRIPTION)
+def vla_inference_worker():
+    """Background thread running SmolVLA VLA neural network action chunk inference asynchronously."""
+    global latest_obs_raw, latest_action_chunk
+
+    print("Background VLA inference worker thread started.")
+    while not stop_event.is_set():
+        with obs_lock:
+            current_obs = latest_obs_raw
+
+        raw_policy_obs = format_obs_for_policy(current_obs, TASK_DESCRIPTION)
         policy_obs = preprocessor(raw_policy_obs)
 
         with torch.no_grad():
@@ -98,46 +114,93 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
         chunk_tensor = postprocessor(action_chunk)
         chunk_np = chunk_tensor.cpu().numpy().squeeze(0)  # Shape: (50, 4)
 
-        # Step B: Execute execution_horizon steps open-loop from predicted chunk at 20 FPS
-        steps_to_exec = min(execution_horizon, len(chunk_np))
-        for i in range(steps_to_exec):
-            frame_start_time = time.time()
-            pred_act = chunk_np[i]
-            curr_eef_pos = obs["agent_pos"][0, :3]
-            target_eef_pos = pred_act[:3]
+        with chunk_lock:
+            latest_action_chunk = chunk_np
 
-            # Delta target position command
-            delta_pos = (target_eef_pos - curr_eef_pos) * 3.5
+        time.sleep(0.01)  # Yield CPU to main thread physics loop
 
-            # Gripper mapping (+1.0 close, -1.0 open in Robosuite)
-            model_grip = pred_act[3]
-            gripper_val = 1.0 if model_grip > 0.0 else -1.0
 
-            rpy_zero = np.zeros((1, 3), dtype=np.float32)
-            env_action = np.concatenate(
-                [np.expand_dims(delta_pos, axis=0), rpy_zero, np.array([[gripper_val]])], axis=-1
-            )
+# Start background VLA inference thread
+vla_thread = threading.Thread(target=vla_inference_worker, daemon=True)
+vla_thread.start()
 
-            obs, reward, terminated, truncated, info = vec_env.step(env_action)
-            step += 1
+# Wait for first VLA prediction to be ready
+print("Waiting for initial VLA action chunk prediction...")
+while latest_action_chunk is None:
+    time.sleep(0.05)
+print("Initial action chunk received. Starting simulation & rendering GUI viewer...\n")
 
-            viewer.sync()
+# Controller proportional gain: maps physical meters/step to normalized [-1.0, 1.0] OSC_POSE action
+POS_SCALE = 20.0  # 1.0 / 0.05m max OSC step size
+# 4. Launch native MuJoCo passive viewer GUI window and run main physics loop at 20 FPS
+with mujoco.viewer.launch_passive(m, d) as viewer:
+    viewer._opt.geomgroup[0] = 0
+    viewer._opt.geomgroup[1] = 1
 
-            # Maintain exact 20 FPS loop pacing (0.05s per control frame)
-            elapsed = time.time() - frame_start_time
-            sleep_time = CONTROL_DT - elapsed
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+    step = 0
+    chunk_step_idx = 0
 
-            if not viewer.is_running():
-                print(f"MuJoCo viewer window closed at step {step}.")
-                break
+    while viewer.is_running() and step < 2000:
+        frame_start_time = time.time()
 
-            if terminated[0] or truncated[0]:
-                print(f"Episode finished at step {step}, resetting environment...")
-                obs, info = vec_env.reset()
-                policy.reset()
-                break
+        # Update background worker observation
+        with obs_lock:
+            latest_obs_raw = obs
 
+        # Get latest predicted action chunk from background worker
+        with chunk_lock:
+            current_chunk = latest_action_chunk
+
+        if current_chunk is not None:
+            pred_act = current_chunk[min(chunk_step_idx, len(current_chunk) - 1)]
+            chunk_step_idx += 1
+            if chunk_step_idx >= len(current_chunk):
+                chunk_step_idx = 0  # Cycle chunk steps if chunk hasn't updated yet
+        else:
+            pred_act = np.zeros(4, dtype=np.float32)
+
+        # Pure End-to-End VLA Policy Control (No privileged simulation reads)
+        curr_eef = obs["agent_pos"][0, :3]
+        target_eef = pred_act[:3]
+        model_grip = pred_act[3]
+
+        # Gripper action directly from VLA policy prediction
+        gripper_val = 1.0 if model_grip > 0.0 else -1.0
+        # print(f"model : gripper : {model_grip} , robot: gripper , {gripper_val}" )
+        # End-effector delta position mapped into normalized [-1.0, 1.0] action space
+        delta_pos = np.clip((target_eef - curr_eef) * POS_SCALE, -1.0, 1.0)
+        env_action = np.concatenate(
+            [np.expand_dims(delta_pos, axis=0), np.zeros((1, 3)), np.array([[gripper_val]])], axis=-1
+        )
+        print(
+            f"Step {step:04d} | EEF: {curr_eef.round(3)} | VLA Target EEF: {target_eef.round(3)} | VLA Grip: {model_grip:.3f} -> Env Grip: {gripper_val:.1f}"
+        )
+
+        # if step % 20 == 0:
+        #     print(
+        #         f"Step {step:04d} | EEF: {curr_eef.round(3)} | VLA Target EEF: {target_eef.round(3)} | VLA Grip: {model_grip:.3f} -> Env Grip: {gripper_val:.1f}"
+        #     )
+
+        obs, reward, terminated, truncated, info = vec_env.step(env_action)
+        step += 1
+
+        viewer.sync()
+
+        # Maintain exact 20 FPS loop pacing (0.05s per control frame)
+        elapsed = time.time() - frame_start_time
+        sleep_time = CONTROL_DT - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+        if not viewer.is_running():
+            print(f"MuJoCo viewer window closed at step {step}.")
+            break
+
+        if terminated[0] or truncated[0]:
+            print(f"Episode finished at step {step}, resetting environment...")
+            obs, info = vec_env.reset()
+            policy.reset()
+
+stop_event.set()
 vec_env.close()
 print("Simulation finished.")
