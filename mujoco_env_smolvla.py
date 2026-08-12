@@ -67,6 +67,9 @@ def format_obs_for_policy(obs_dict, task_description):
     }
 
 
+# Track gripper state to prevent flickering (latching)
+last_gripper_state = 1.0  # Start open (+1.0 in Robosuite)
+
 # 4. Launch native MuJoCo passive viewer GUI window and run policy loop
 with mujoco.viewer.launch_passive(m, d) as viewer:
     viewer._opt.geomgroup[0] = 0
@@ -86,14 +89,25 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
             act_np = np.expand_dims(act_np, axis=0)
 
         # Convert predicted absolute EEF position [x, y, z] to relative delta control commands [dx, dy, dz]
-        # and invert gripper sign (-act_np[:, 3:]) to match Robosuite's gripper conventions (-1.0 = close, +1.0 = open)
         if act_np.shape[-1] == 4:
             curr_eef_pos = obs["agent_pos"][0, :3]
             target_eef_pos = act_np[0, :3]
-            delta_pos = (target_eef_pos - curr_eef_pos) * 5.0  # Controller gain scaling factor
-            gripper = -act_np[:, 3:]  # Invert gripper sign for Robosuite controller convention
-            rpy_zero = np.zeros((act_np.shape[0], 3), dtype=np.float32)
-            env_action = np.concatenate([np.expand_dims(delta_pos, axis=0), rpy_zero, gripper], axis=-1)
+            delta_pos = np.clip((target_eef_pos - curr_eef_pos) * 10.0, -1.0, 1.0)
+
+            # Binarize and latch gripper action to prevent random open/close flickering
+            model_grip = act_np[0, 3]
+            if model_grip > 0.1:
+                env_grip = -1.0  # Close gripper in Robosuite
+            elif model_grip < -0.1:
+                env_grip = 1.0  # Open gripper in Robosuite
+            else:
+                env_grip = last_gripper_state
+            last_gripper_state = env_grip
+
+            rpy_zero = np.zeros((1, 3), dtype=np.float32)
+            env_action = np.concatenate(
+                [np.expand_dims(delta_pos, axis=0), rpy_zero, np.array([[env_grip]])], axis=-1
+            )
         else:
             env_action = act_np
 
@@ -110,6 +124,7 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
             print(f"Episode finished at step {step}, resetting environment...")
             obs, info = vec_env.reset()
             policy.reset()
+            last_gripper_state = 1.0
 
 vec_env.close()
 print("Environment closed successfully.")
