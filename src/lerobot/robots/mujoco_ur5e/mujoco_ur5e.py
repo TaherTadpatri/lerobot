@@ -44,8 +44,8 @@ class MuJoCoUR5eRobot(Robot):
         self.stop_event = threading.Event()
         self.current_target_action = np.zeros((1, 7), dtype=np.float32)
 
-        # Proportional position gain scale (1.0 / 0.05m max step limit)
-        self.POS_SCALE = 1.0
+        # Proportional position gain scale mapping spatial error into normalized [-1.0, 1.0] OSC space
+        self.POS_SCALE = getattr(self.config, "pos_scale", 8.0)
 
     @property
     def observation_features(self) -> dict:
@@ -169,7 +169,7 @@ class MuJoCoUR5eRobot(Robot):
         return obs_dict
 
     def send_action(self, action: dict | np.ndarray) -> dict:
-        """Update target action for background physics thread (non-blocking)."""
+        """Convert policy actions into Operational Space Control (OSC) delta commands for MuJoCo (non-blocking)."""
         if not self._is_connected:
             raise RuntimeError("Robot is not connected. Call connect() first.")
 
@@ -183,30 +183,18 @@ class MuJoCoUR5eRobot(Robot):
         if act_arr.ndim == 2:
             act_arr = act_arr.squeeze(0)
 
-        with self.obs_lock:
-            curr_eef = self.last_obs["agent_pos"][0, :3]
-
         if len(act_arr) == 4:
             # Absolute target position [x, y, z] + gripper
             target_eef = act_arr[:3]
             model_grip = act_arr[3]
 
-            # Smooth Adaptive Velocity Control (Independent of static POS_SCALE multiplier)
-            # Caps maximum step move at 2.5cm per frame to prevent jerking/falling objects,
-            # and smoothly decelerates to zero error at target.
-            max_step_meter = 0.025  # 2.5 cm max physical move per frame
-            osc_max = 0.05  # Robosuite controller maximum step limit
+            with self.obs_lock:
+                curr_eef = self.last_obs["agent_pos"][0, :3]
 
-            error = target_eef - curr_eef
-            dist = np.linalg.norm(error)
-
-            if dist > 1e-4:
-                step_dist = min(dist, max_step_meter)
-                delta_pos = (error / dist) * (step_dist / osc_max)
-            else:
-                delta_pos = np.zeros(3, dtype=np.float32)
-
+            # Compute relative delta position mapped into normalized [-1.0, 1.0] action space
+            delta_pos = np.clip((target_eef - curr_eef) * self.POS_SCALE, -1.0, 1.0)
             gripper_val = 1.0 if model_grip > 0.0 else -1.0
+
             env_act = np.concatenate(
                 [np.expand_dims(delta_pos, 0), np.zeros((1, 3)), np.array([[gripper_val]])], axis=-1
             )

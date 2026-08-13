@@ -17,7 +17,10 @@ class MuJoCoUR5eRobotConfig(RobotConfig):
     task: str = "pick_place_can"
 
     # Control frequency (FPS)
-    fps: int = 20
+    fps: int = 40
 
     # Whether to launch native interactive MuJoCo passive 3D GUI window
     render_gui: bool = True
+
+    # Position delta gain scale mapping spatial error into normalized [-1.0, 1.0] OSC action space
+    pos_scale: float = 5.0
