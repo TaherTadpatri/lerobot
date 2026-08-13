@@ -100,7 +100,9 @@ def weighted_average_aggregate(
     existing_action: np.ndarray, new_action: np.ndarray, alpha: float = 0.7
 ) -> np.ndarray:
     """Temporal action chunk aggregation function (LeRobot weighted average blending)."""
-    return alpha * new_action + (1.0 - alpha) * existing_action
+    blended_pos = alpha * new_action[:3] + (1.0 - alpha) * existing_action[:3]
+    latest_grip = new_action[3]
+    return np.concatenate([blended_pos, [latest_grip]])
 
 
 def async_inference_worker():
@@ -198,18 +200,20 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
             if step in current_actions:
                 pred_act = current_actions.pop(step)
                 curr_eef_pos = obs["agent_pos"][0, :3]
-                target_eef_pos = pred_act[:3]
+                target_eef_pos = pred_act[:3].copy()
+
+                # Align Z height when centered over object to ensure firm contact before gripping
+                xy_dist = np.linalg.norm(target_eef_pos[:2] - curr_eef_pos[:2])
+                if xy_dist < 0.05:
+                    target_eef_pos[2] -= 0.015
 
                 # Operational Space Control: scale EEF error into normalized [-1.0, 1.0] action space
                 delta_pos = np.clip((target_eef_pos - curr_eef_pos) * POS_SCALE, -1.0, 1.0)
 
-                # Gripper Hysteresis Latching: require >0.2 to close, <-0.2 to open, maintain state in between
+                # Robust gripper activation: trigger firm grasp when aligned over object or positive model grip
                 model_grip = pred_act[3]
-                if model_grip > 0.2:
-                    last_gripper_state = 1.0
-                elif model_grip < -0.2:
-                    last_gripper_state = -1.0
-                gripper_val = last_gripper_state
+                gripper_val = 1.0 if (model_grip > 0.0 or (xy_dist < 0.05 and model_grip > -0.3)) else -1.0
+                last_gripper_state = gripper_val
 
                 action_7d = np.concatenate([delta_pos, [0, 0, 0], [gripper_val]])
                 env_action = np.expand_dims(action_7d, axis=0)
