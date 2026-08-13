@@ -19,15 +19,19 @@ import mujoco.viewer
 import numpy as np
 import torch
 
+from lerobot.configs.types import RTCAttentionSchedule
 from lerobot.envs import make_env
 from lerobot.envs.configs import HubEnvConfig
 from lerobot.policies.factory import make_pre_post_processors
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
+from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.smolvla import SmolVLAPolicy
 
 # 1. Configuration (20 FPS control rate & single environment)
 FPS = 20
 CONTROL_DT = 1.0 / FPS  # 0.05s per control frame
 TASK_DESCRIPTION = "Pick up the can and place it in the correct bin."
+POS_SCALE = 8.0  # Controller proportional gain: maps physical error (m) to normalized [-1.0, 1.0] OSC action
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -48,10 +52,20 @@ sim = robosuite_env.sim
 m = sim.model._model
 d = sim.data._data
 
-# 3. Load SmolVLA Policy
+# 3. Load SmolVLA Policy with LeRobot Real-Time Control (RTC)
 model_id = "castanetnicolas/smolvla_ur5e_pick_place"
 print(f"Loading SmolVLA policy checkpoint '{model_id}'...")
 policy = SmolVLAPolicy.from_pretrained(model_id)
+
+# Configure LeRobot Real-Time Control (RTC) parameters for smooth action chunk blending
+policy.config.rtc_config = RTCConfig(
+    enabled=True,
+    execution_horizon=10,
+    max_guidance_weight=5.0,
+    prefix_attention_schedule=RTCAttentionSchedule.EXP,
+)
+policy.rtc_processor = RTCProcessor(policy.config.rtc_config)
+
 policy.to(device)
 policy.eval()
 policy.reset()
@@ -148,6 +162,8 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
     while viewer.is_running():
         obs, info = vec_env.reset()
         policy.reset()
+        last_gripper_state = -1.0  # Reset gripper state to open (-1.0) on episode start
+
         with action_queue_lock:
             current_actions.clear()
             while not action_queue.empty():
@@ -185,10 +201,16 @@ with mujoco.viewer.launch_passive(m, d) as viewer:
                 curr_eef_pos = obs["agent_pos"][0, :3]
                 target_eef_pos = pred_act[:3]
 
-                delta_pos = (target_eef_pos - curr_eef_pos) * 8.0
+                # Operational Space Control: scale EEF error into normalized [-1.0, 1.0] action space
+                delta_pos = np.clip((target_eef_pos - curr_eef_pos) * POS_SCALE, -1.0, 1.0)
 
+                # Gripper Hysteresis Latching: require >0.2 to close, <-0.2 to open, maintain state in between
                 model_grip = pred_act[3]
-                gripper_val = 1.0 if model_grip > 0.0 else -1.0
+                if model_grip > 0.2:
+                    last_gripper_state = 1.0
+                elif model_grip < -0.2:
+                    last_gripper_state = -1.0
+                gripper_val = last_gripper_state
 
                 action_7d = np.concatenate([delta_pos, [0, 0, 0], [gripper_val]])
                 env_action = np.expand_dims(action_7d, axis=0)
