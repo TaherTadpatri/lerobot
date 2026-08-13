@@ -24,7 +24,6 @@ from lerobot.envs import make_env
 from lerobot.envs.configs import HubEnvConfig
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
-from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.policies.smolvla import SmolVLAPolicy
 
 # 1. Configuration (20 FPS control rate & single environment)
@@ -64,7 +63,7 @@ policy.config.rtc_config = RTCConfig(
     max_guidance_weight=5.0,
     prefix_attention_schedule=RTCAttentionSchedule.EXP,
 )
-policy.rtc_processor = RTCProcessor(policy.config.rtc_config)
+policy.init_rtc_processor()
 
 policy.to(device)
 policy.eval()
